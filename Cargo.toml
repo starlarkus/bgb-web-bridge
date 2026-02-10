@@ -1,5 +1,5 @@
 [package]
-name = "gb-bridge"
+name = "bgb-web-bridge"
 version = "0.1.0"
 edition = "2021"
 description = "Bridge between BGB emulator and GB Tetris Web via WebSocket"
