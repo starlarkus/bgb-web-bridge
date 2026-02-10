@@ -2,9 +2,11 @@
 ///
 /// Commands:
 ///   1   = version handshake
-///   104 = sync (timestamp keepalive)
-///   108 = master transfer (we send a byte)
-///   109 = slave response (BGB returns a byte)
+///   104 = sync1 / master transfer (send a byte to the Game Boy)
+///   105 = sync2 / slave response (Game Boy sends a byte back)
+///   106 = sync3 / acknowledgement
+///   108 = status (running/paused flags)
+///   109 = want disconnect
 #[derive(Debug, Clone, Copy)]
 pub struct BgbPacket {
     pub command: u8,
