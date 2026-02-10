@@ -1,0 +1,9 @@
+[package]
+name = "gb-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Bridge between BGB emulator and GB Tetris Web via WebSocket"
+
+[dependencies]
+eframe = "0.29"
+tungstenite = "0.24"
