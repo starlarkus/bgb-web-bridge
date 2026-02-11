@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -61,7 +61,7 @@ fn handshake(stream: &mut TcpStream, start: Instant) -> Result<(), String> {
     send_packet(stream, &BgbPacket::new(1, 1, 4, 0, 0))?;
 
     // Read version response
-    let resp = read_packet(stream)?;
+    let resp = read_packet(stream).map_err(|e| format!("BGB handshake read: {}", e))?;
     if resp.command != 1 {
         return Err(format!("Expected version (cmd=1), got cmd={}", resp.command));
     }
@@ -81,79 +81,113 @@ fn bgb_thread(
     recv_tx: mpsc::Sender<u8>,
     log_tx: Option<mpsc::Sender<String>>,
 ) {
-    // Use a short read timeout so we can check for pending sends
-    stream.set_read_timeout(Some(Duration::from_millis(10))).ok();
+    // Non-blocking mode — we manually poll with short sleeps
+    stream.set_nonblocking(true).ok();
+
+    let log = |msg: String| {
+        if let Some(ref tx) = log_tx {
+            let _ = tx.send(msg);
+        }
+    };
 
     let mut waiting_for_response = false;
+    let mut read_buf = [0u8; 64];
+    let mut read_pos: usize = 0;
 
     loop {
         // Check if there's a byte to send (non-blocking)
         if !waiting_for_response {
-            if let Ok(byte) = send_rx.try_recv() {
-                let ts = timestamp(start);
-                if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x80, 0, ts)).is_err() {
-                    return; // BGB disconnected
+            match send_rx.try_recv() {
+                Ok(byte) => {
+                    let ts = timestamp(start);
+                    if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x80, 0, ts)).is_err() {
+                        log("BGB send failed, disconnecting".into());
+                        return;
+                    }
+                    waiting_for_response = true;
                 }
-                waiting_for_response = true;
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    log("Bridge dropped, closing BGB connection".into());
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
 
-        // Try to read a packet from BGB (with short timeout)
-        match read_packet(&mut stream) {
-            Ok(pkt) => {
-                match pkt.command {
-                    104 => {
-                        // Sync1 from BGB — respond with sync2
-                        let _ = send_packet(&mut stream, &BgbPacket::new(105, 0, 0x80, 0, pkt.timestamp));
-                    }
-                    105 => {
-                        // Sync2 — data response from BGB
-                        if waiting_for_response {
-                            waiting_for_response = false;
-                            if recv_tx.send(pkt.data).is_err() {
-                                return; // Main thread dropped
-                            }
-                        }
-                    }
-                    106 => {
-                        // Sync3 — echo it back
-                        let _ = send_packet(&mut stream, &BgbPacket::new(106, pkt.data, pkt.extra1, pkt.extra2, pkt.timestamp));
-                    }
-                    108 => {
-                        // Status — respond with running
-                        let _ = send_packet(&mut stream, &BgbPacket::new(108, 1, 0, 0, pkt.timestamp));
-                    }
-                    109 => {
-                        // Disconnect
-                        if let Some(ref tx) = log_tx {
-                            let _ = tx.send("BGB sent disconnect".into());
-                        }
-                        return;
-                    }
-                    _ => {}
-                }
+        // Read available bytes into packet buffer (non-blocking, no desync risk)
+        match stream.read(&mut read_buf[read_pos..]) {
+            Ok(0) => {
+                log("BGB connection closed".into());
+                return;
             }
-            Err(ref e) if e.contains("timed out") || e.contains("WouldBlock") => {
-                // No data available — this is normal, just loop
-                // Small sleep to avoid busy-spinning when truly idle
-                if !waiting_for_response {
+            Ok(n) => {
+                read_pos += n;
+            }
+            Err(ref e) if is_timeout(e) => {
+                // No data available right now
+                if read_pos == 0 && !waiting_for_response {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
-            Err(_) => {
-                // Connection error
+            Err(e) => {
+                log(format!("BGB connection lost: {}", e));
                 return;
             }
         }
+
+        // Process complete packets
+        while read_pos >= 8 {
+            let pkt = BgbPacket::from_bytes([
+                read_buf[0], read_buf[1], read_buf[2], read_buf[3],
+                read_buf[4], read_buf[5], read_buf[6], read_buf[7],
+            ]);
+
+            // Shift remaining bytes to front
+            let remaining = read_pos - 8;
+            if remaining > 0 {
+                read_buf.copy_within(8.., 0);
+            }
+            read_pos = remaining;
+
+            match pkt.command {
+                104 => {
+                    let _ = send_packet(&mut stream, &BgbPacket::new(105, 0, 0x80, 0, pkt.timestamp));
+                }
+                105 => {
+                    if waiting_for_response {
+                        waiting_for_response = false;
+                        if recv_tx.send(pkt.data).is_err() {
+                            return;
+                        }
+                    }
+                }
+                106 => {
+                    let _ = send_packet(&mut stream, &BgbPacket::new(106, pkt.data, pkt.extra1, pkt.extra2, pkt.timestamp));
+                }
+                108 => {
+                    let _ = send_packet(&mut stream, &BgbPacket::new(108, 1, 0, 0, pkt.timestamp));
+                }
+                109 => {
+                    log("BGB sent disconnect".into());
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
+}
+
+/// Check if an IO error is a timeout/would-block (cross-platform).
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
 }
 
 fn send_packet(stream: &mut TcpStream, pkt: &BgbPacket) -> Result<(), String> {
     stream.write_all(&pkt.to_bytes()).map_err(|e| format!("BGB send: {}", e))
 }
 
-fn read_packet(stream: &mut TcpStream) -> Result<BgbPacket, String> {
+fn read_packet(stream: &mut TcpStream) -> Result<BgbPacket, io::Error> {
     let mut buf = [0u8; 8];
-    stream.read_exact(&mut buf).map_err(|e| format!("{}", e))?;
+    stream.read_exact(&mut buf)?;
     Ok(BgbPacket::from_bytes(buf))
 }

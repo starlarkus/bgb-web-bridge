@@ -83,7 +83,13 @@ impl BridgeApp {
         if let Some(rx) = &self.event_rx {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    WsEvent::Log(msg) => self.log.push(msg),
+                    WsEvent::Log(msg) => {
+                        self.log.push(msg);
+                        // Cap log to prevent unbounded memory growth
+                        if self.log.len() > 500 {
+                            self.log.drain(..self.log.len() - 300);
+                        }
+                    }
                     WsEvent::BrowserConnected => self.browser_connected = true,
                     WsEvent::BrowserDisconnected => self.browser_connected = false,
                     WsEvent::BgbConnected => self.bgb_connected = true,
