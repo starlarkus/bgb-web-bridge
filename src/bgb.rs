@@ -91,6 +91,7 @@ fn bgb_thread(
     };
 
     let mut waiting_for_response = false;
+    let mut pending_byte: u8 = 0; // The byte we sent in our last cmd=104
     let mut read_buf = [0u8; 64];
     let mut read_pos: usize = 0;
 
@@ -100,10 +101,12 @@ fn bgb_thread(
             match send_rx.try_recv() {
                 Ok(byte) => {
                     let ts = timestamp(start);
-                    if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x80, 0, ts)).is_err() {
+                    // SC=0x81: internal clock (we are the master / clock provider)
+                    if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x81, 0, ts)).is_err() {
                         log("BGB send failed, disconnecting".into());
                         return;
                     }
+                    pending_byte = byte;
                     waiting_for_response = true;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -151,7 +154,18 @@ fn bgb_thread(
 
             match pkt.command {
                 104 => {
-                    let _ = send_packet(&mut stream, &BgbPacket::new(105, 0, 0x80, 0, pkt.timestamp));
+                    if waiting_for_response {
+                        // Simultaneous exchange: both sides sent sync1.
+                        // Respond with our pending byte and treat BGB's data as our response.
+                        let _ = send_packet(&mut stream, &BgbPacket::new(105, pending_byte, 0x80, 0, pkt.timestamp));
+                        waiting_for_response = false;
+                        if recv_tx.send(pkt.data).is_err() {
+                            return;
+                        }
+                    } else {
+                        // BGB initiated a transfer while we have nothing to send
+                        let _ = send_packet(&mut stream, &BgbPacket::new(105, 0, 0x80, 0, pkt.timestamp));
+                    }
                 }
                 105 => {
                     if waiting_for_response {
@@ -160,6 +174,7 @@ fn bgb_thread(
                             return;
                         }
                     }
+                    // else: stale response after simultaneous exchange, ignore
                 }
                 106 => {
                     let _ = send_packet(&mut stream, &BgbPacket::new(106, pkt.data, pkt.extra1, pkt.extra2, pkt.timestamp));
