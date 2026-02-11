@@ -1,3 +1,5 @@
+use std::sync::mpsc;
+
 use crate::bgb::BgbClient;
 
 /// Magic prefix used by the firmware for timing config and printer mode detection.
@@ -17,8 +19,8 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(host: &str, port: u16) -> Result<Self, String> {
-        let bgb = BgbClient::connect(host, port)?;
+    pub fn new(host: &str, port: u16, log_tx: Option<mpsc::Sender<String>>) -> Result<Self, String> {
+        let bgb = BgbClient::connect(host, port, log_tx)?;
         Ok(Self { bgb })
     }
 
@@ -27,16 +29,14 @@ impl Bridge {
     /// - 36-byte printer mode magic → return [0x00] (not supported)
     /// - 36-byte timing config magic → return [0x01] (ack)
     /// - Otherwise: exchange each byte via BGB SPI, return all responses
-    pub fn handle_message(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn handle_message(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         // Check for printer mode magic (36 bytes: 32-byte prefix + "PRNT")
         if data.len() == 36 && data[..32] == MAGIC_PREFIX && data[32..36] == PRINTER_SUFFIX {
-            // Printer mode not supported in emulator bridge
             return Ok(vec![0x00]);
         }
 
         // Check for timing config magic (36 bytes: 32-byte prefix + 4 config bytes)
         if data.len() == 36 && data[..32] == MAGIC_PREFIX {
-            // Timing config — acknowledge but ignore (BGB handles its own timing)
             return Ok(vec![0x01]);
         }
 

@@ -98,8 +98,20 @@ fn handle_connection(
     event_tx: &mpsc::Sender<WsEvent>,
     cmd_rx: &mpsc::Receiver<WsCommand>,
 ) {
+    // Create a log sender that forwards BGB thread logs to the GUI
+    let bgb_log_tx = {
+        let tx = event_tx.clone();
+        let (log_tx, log_rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok(msg) = log_rx.recv() {
+                let _ = tx.send(WsEvent::Log(msg));
+            }
+        });
+        log_tx
+    };
+
     // Connect to BGB
-    let mut bridge = match Bridge::new(bgb_host, bgb_port) {
+    let bridge = match Bridge::new(bgb_host, bgb_port, Some(bgb_log_tx)) {
         Ok(b) => {
             let _ = event_tx.send(WsEvent::BgbConnected);
             let _ = event_tx.send(WsEvent::Log("Connected to BGB".into()));
