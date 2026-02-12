@@ -1,4 +1,6 @@
 use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::bgb::BgbClient;
 
@@ -19,8 +21,8 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(host: &str, port: u16, log_tx: Option<mpsc::Sender<String>>) -> Result<Self, String> {
-        let bgb = BgbClient::connect(host, port, log_tx)?;
+    pub fn new(host: &str, port: u16, log_tx: Option<mpsc::Sender<String>>, verbose: Arc<AtomicBool>) -> Result<Self, String> {
+        let bgb = BgbClient::connect(host, port, log_tx, verbose)?;
         Ok(Self { bgb })
     }
 

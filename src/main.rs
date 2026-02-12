@@ -6,6 +6,9 @@ mod protocol;
 mod websocket;
 
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::io::Write as IoWrite;
 use eframe::egui;
 use websocket::{WsCommand, WsEvent};
 
@@ -25,11 +28,15 @@ struct BridgeApp {
     bgb_port: String,
     ws_port: String,
     running: bool,
+    verbose: bool,
     bgb_connected: bool,
     browser_connected: bool,
     log: Vec<String>,
     cmd_tx: Option<mpsc::Sender<WsCommand>>,
     event_rx: Option<mpsc::Receiver<WsEvent>>,
+    verbose_flag: Option<Arc<AtomicBool>>,
+    log_file: Option<std::io::BufWriter<std::fs::File>>,
+    start_instant: Option<std::time::Instant>,
 }
 
 impl Default for BridgeApp {
@@ -38,11 +45,15 @@ impl Default for BridgeApp {
             bgb_port: "8765".into(),
             ws_port: "8767".into(),
             running: false,
+            verbose: false,
             bgb_connected: false,
             browser_connected: false,
             log: vec!["Ready. Configure ports and click Start.".into()],
             cmd_tx: None,
             event_rx: None,
+            verbose_flag: None,
+            log_file: None,
+            start_instant: None,
         }
     }
 }
@@ -61,16 +72,34 @@ impl BridgeApp {
         let (event_tx, event_rx) = mpsc::channel();
         let (cmd_tx, cmd_rx) = mpsc::channel();
 
+        let verbose_flag = Arc::new(AtomicBool::new(self.verbose));
+        self.verbose_flag = Some(verbose_flag.clone());
+
+        // Open log file
+        let start_instant = std::time::Instant::now();
+        self.start_instant = Some(start_instant);
+        match std::fs::File::create("bgb-bridge.log") {
+            Ok(f) => {
+                let mut writer = std::io::BufWriter::new(f);
+                let _ = writeln!(writer, "=== BGB Bridge Log ===");
+                self.log_file = Some(writer);
+            }
+            Err(e) => {
+                self.log.push(format!("Warning: could not create log file: {}", e));
+            }
+        }
+
         self.event_rx = Some(event_rx);
         self.cmd_tx = Some(cmd_tx);
         self.running = true;
         self.bgb_connected = false;
         self.browser_connected = false;
         self.log.push(format!("Starting... WS:{} BGB:{}", ws_port, bgb_port));
+        self.write_log("Starting bridge");
 
         let bgb_host = "127.0.0.1".to_string();
         std::thread::spawn(move || {
-            websocket::run(ws_port, bgb_host, bgb_port, event_tx, cmd_rx);
+            websocket::run(ws_port, bgb_host, bgb_port, event_tx, cmd_rx, verbose_flag);
         });
     }
 
@@ -79,6 +108,21 @@ impl BridgeApp {
             let _ = tx.send(WsCommand::Stop);
         }
         self.log.push("Stop requested...".into());
+        self.write_log("Stop requested");
+        // Flush and close log file
+        if let Some(ref mut f) = self.log_file {
+            let _ = f.flush();
+        }
+    }
+
+    fn write_log(&mut self, msg: &str) {
+        if let (Some(ref mut f), Some(start)) = (&mut self.log_file, self.start_instant) {
+            let elapsed = start.elapsed();
+            let secs = elapsed.as_secs();
+            let millis = elapsed.subsec_millis();
+            let _ = writeln!(f, "[{:02}:{:02}:{:02}.{:03}] {}",
+                secs / 3600, (secs % 3600) / 60, secs % 60, millis, msg);
+        }
     }
 
     fn poll_events(&mut self) {
@@ -86,6 +130,7 @@ impl BridgeApp {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     WsEvent::Log(msg) => {
+                        self.write_log(&msg);
                         self.log.push(msg);
                         // Cap log to prevent unbounded memory growth
                         if self.log.len() > 500 {
@@ -103,10 +148,19 @@ impl BridgeApp {
                         self.cmd_tx = None;
                         self.event_rx = None;
                         self.log.push("Stopped.".into());
+                        self.write_log("Stopped");
+                        if let Some(ref mut f) = self.log_file {
+                            let _ = f.flush();
+                        }
+                        self.verbose_flag = None;
                         return;
                     }
                 }
             }
+        }
+        // Periodically flush log file
+        if let Some(ref mut f) = self.log_file {
+            let _ = f.flush();
         }
     }
 }
@@ -135,14 +189,24 @@ impl eframe::App for BridgeApp {
 
             ui.add_space(8.0);
 
-            // Start/Stop button
-            if self.running {
-                if ui.button("Stop").clicked() {
-                    self.stop();
+            // Start/Stop and Verbose
+            ui.horizontal(|ui| {
+                if self.running {
+                    if ui.button("Stop").clicked() {
+                        self.stop();
+                    }
+                } else if ui.button("Start").clicked() {
+                    self.start();
                 }
-            } else if ui.button("Start").clicked() {
-                self.start();
-            }
+
+                ui.add_space(16.0);
+
+                if ui.checkbox(&mut self.verbose, "Verbose Logs").changed() {
+                    if let Some(ref flag) = self.verbose_flag {
+                        flag.store(self.verbose, Ordering::Relaxed);
+                    }
+                }
+            });
 
             ui.add_space(12.0);
             ui.separator();

@@ -1,5 +1,7 @@
 use std::net::TcpListener;
 use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use tungstenite::protocol::Message;
 use tungstenite::accept;
@@ -30,6 +32,7 @@ pub fn run(
     bgb_port: u16,
     event_tx: mpsc::Sender<WsEvent>,
     cmd_rx: mpsc::Receiver<WsCommand>,
+    verbose: Arc<AtomicBool>,
 ) {
     let addr = format!("0.0.0.0:{}", ws_port);
     let listener = match TcpListener::bind(&addr) {
@@ -83,7 +86,7 @@ pub fn run(
 
         let _ = event_tx.send(WsEvent::BrowserConnected);
 
-        handle_connection(websocket, &bgb_host, bgb_port, &event_tx, &cmd_rx);
+        handle_connection(websocket, &bgb_host, bgb_port, &event_tx, &cmd_rx, &verbose);
 
         let _ = event_tx.send(WsEvent::BrowserDisconnected);
     }
@@ -97,6 +100,7 @@ fn handle_connection(
     bgb_port: u16,
     event_tx: &mpsc::Sender<WsEvent>,
     cmd_rx: &mpsc::Receiver<WsCommand>,
+    verbose: &Arc<AtomicBool>,
 ) {
     // Create a log sender that forwards BGB thread logs to the GUI
     let bgb_log_tx = {
@@ -111,7 +115,7 @@ fn handle_connection(
     };
 
     // Connect to BGB
-    let bridge = match Bridge::new(bgb_host, bgb_port, Some(bgb_log_tx)) {
+    let bridge = match Bridge::new(bgb_host, bgb_port, Some(bgb_log_tx), verbose.clone()) {
         Ok(b) => {
             let _ = event_tx.send(WsEvent::BgbConnected);
             let _ = event_tx.send(WsEvent::Log("Connected to BGB".into()));

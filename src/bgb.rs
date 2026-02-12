@@ -1,6 +1,8 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::protocol::BgbPacket;
@@ -18,7 +20,7 @@ pub struct BgbClient {
 }
 
 impl BgbClient {
-    pub fn connect(host: &str, port: u16, log_tx: Option<mpsc::Sender<String>>) -> Result<Self, String> {
+    pub fn connect(host: &str, port: u16, log_tx: Option<mpsc::Sender<String>>, verbose: Arc<AtomicBool>) -> Result<Self, String> {
         let addr = format!("{}:{}", host, port);
         let mut stream = TcpStream::connect(&addr)
             .map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
@@ -32,7 +34,7 @@ impl BgbClient {
         let (recv_tx, recv_rx) = mpsc::channel::<u8>();
 
         let thread = std::thread::spawn(move || {
-            bgb_thread(stream, start_time, send_rx, recv_tx, log_tx);
+            bgb_thread(stream, start_time, send_rx, recv_tx, log_tx, verbose);
         });
 
         Ok(Self {
@@ -80,6 +82,7 @@ fn bgb_thread(
     send_rx: mpsc::Receiver<u8>,
     recv_tx: mpsc::Sender<u8>,
     log_tx: Option<mpsc::Sender<String>>,
+    verbose: Arc<AtomicBool>,
 ) {
     // Non-blocking mode — we manually poll with short sleeps
     stream.set_nonblocking(true).ok();
@@ -90,10 +93,20 @@ fn bgb_thread(
         }
     };
 
+    let vlog = |msg: String| {
+        if verbose.load(Ordering::Relaxed) {
+            if let Some(ref tx) = log_tx {
+                let _ = tx.send(msg);
+            }
+        }
+    };
+
     let mut waiting_for_response = false;
     let mut pending_byte: u8 = 0; // The byte we sent in our last cmd=104
     let mut read_buf = [0u8; 64];
     let mut read_pos: usize = 0;
+    let mut exchange_count: u64 = 0;
+    let mut last_exchange_time = Instant::now();
 
     loop {
         // Check if there's a byte to send (non-blocking)
@@ -108,6 +121,9 @@ fn bgb_thread(
                     }
                     pending_byte = byte;
                     waiting_for_response = true;
+                    exchange_count += 1;
+                    last_exchange_time = Instant::now();
+                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x81 ts={}", exchange_count, byte, ts));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log("Bridge dropped, closing BGB connection".into());
@@ -127,7 +143,14 @@ fn bgb_thread(
                 read_pos += n;
             }
             Err(ref e) if is_timeout(e) => {
-                // No data available right now
+                // No data available right now — log if we've been waiting a while
+                if waiting_for_response {
+                    let waited = last_exchange_time.elapsed();
+                    if waited.as_secs() >= 2 && waited.as_secs() % 2 == 0 && waited.subsec_millis() < 5 {
+                        vlog(format!("[WAIT] sync2 for #{} (sent 0x{:02X}): waiting {}s...",
+                            exchange_count, pending_byte, waited.as_secs()));
+                    }
+                }
                 if read_pos == 0 && !waiting_for_response {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -157,36 +180,51 @@ fn bgb_thread(
                     if waiting_for_response {
                         // Simultaneous exchange: both sides sent sync1.
                         // Respond with our pending byte and treat BGB's data as our response.
+                        let elapsed_ms = last_exchange_time.elapsed().as_millis();
                         let _ = send_packet(&mut stream, &BgbPacket::new(105, pending_byte, 0x80, 0, pkt.timestamp));
                         waiting_for_response = false;
+                        vlog(format!("[RECV] sync1 #{} (SIMUL): bgb_data=0x{:02X} sc=0x{:02X} -> reply 0x{:02X} ({}ms)",
+                            exchange_count, pkt.data, pkt.extra1, pending_byte, elapsed_ms));
                         if recv_tx.send(pkt.data).is_err() {
                             return;
                         }
                     } else {
                         // BGB initiated a transfer while we have nothing to send
                         let _ = send_packet(&mut stream, &BgbPacket::new(105, 0, 0x80, 0, pkt.timestamp));
+                        vlog(format!("[RECV] sync1 (unsolicited): bgb_data=0x{:02X} sc=0x{:02X} -> reply 0x00",
+                            pkt.data, pkt.extra1));
                     }
                 }
                 105 => {
                     if waiting_for_response {
+                        let elapsed_ms = last_exchange_time.elapsed().as_millis();
                         waiting_for_response = false;
+                        vlog(format!("[RECV] sync2 #{}: data=0x{:02X} sc=0x{:02X} ({}ms)",
+                            exchange_count, pkt.data, pkt.extra1, elapsed_ms));
                         if recv_tx.send(pkt.data).is_err() {
                             return;
                         }
+                    } else {
+                        vlog(format!("[RECV] sync2 (stale): data=0x{:02X} sc=0x{:02X} — ignoring",
+                            pkt.data, pkt.extra1));
                     }
-                    // else: stale response after simultaneous exchange, ignore
                 }
                 106 => {
                     let _ = send_packet(&mut stream, &BgbPacket::new(106, pkt.data, pkt.extra1, pkt.extra2, pkt.timestamp));
+                    vlog(format!("[RECV] sync3: data=0x{:02X}", pkt.data));
                 }
                 108 => {
                     let _ = send_packet(&mut stream, &BgbPacket::new(108, 1, 0, 0, pkt.timestamp));
+                    vlog(format!("[RECV] status: data=0x{:02X} extra1=0x{:02X}", pkt.data, pkt.extra1));
                 }
                 109 => {
                     log("BGB sent disconnect".into());
                     return;
                 }
-                _ => {}
+                _ => {
+                    vlog(format!("[RECV] unknown cmd={}: data=0x{:02X} extra1=0x{:02X} extra2=0x{:02X}",
+                        pkt.command, pkt.data, pkt.extra1, pkt.extra2));
+                }
             }
         }
     }
