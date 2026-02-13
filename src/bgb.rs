@@ -101,21 +101,18 @@ fn bgb_thread(
     let mut read_pos: usize = 0;
     let mut exchange_count: u64 = 0;
     let mut last_exchange_time = Instant::now();
-    // Track BGB's emulated clock to stay synchronized.
-    // Using real wall-clock time causes exponential blowup because BGB has to
-    // emulate Game Boy CPU cycles to reach our timestamp.
-    let mut bgb_timestamp: u32 = 0;
+    // Simple monotonic counter for BGB timestamps. We always send timestamps
+    // "in the past" relative to BGB's real clock, so BGB processes transfers
+    // immediately without needing to emulate forward.
+    let mut next_timestamp: u32 = 0;
 
     loop {
         // Check if there's a byte to send (non-blocking)
         if !waiting_for_response {
             match send_rx.try_recv() {
                 Ok(byte) => {
-                    // Use BGB's last known timestamp + reasonable increment to stay in sync
-                    // with BGB's emulated clock. Using wall-clock time causes exponential
-                    // blowup as BGB tries to emulate to catch up to our timestamp.
-                    // 8192 ticks ≈ 3.9ms in GB time (2^21 ticks/sec), roughly one serial transfer.
-                    let ts = bgb_timestamp.wrapping_add(8192);
+                    next_timestamp = next_timestamp.wrapping_add(8192);
+                    let ts = next_timestamp;
                     // SC=0x81: internal clock. We (web client) are the clock master,
                     // the Game Boy in BGB is the slave.
                     if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x81, 0, ts)).is_err() {
@@ -177,9 +174,6 @@ fn bgb_thread(
                 read_buf.copy_within(8.., 0);
             }
             read_pos = remaining;
-
-            // Track BGB's emulated clock from every packet
-            bgb_timestamp = pkt.timestamp;
 
             match pkt.command {
                 104 => {
