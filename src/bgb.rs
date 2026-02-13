@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+// Note: Instant used only for verbose logging (last_exchange_time), not for BGB timestamps.
 
 use crate::protocol::BgbPacket;
 
@@ -27,14 +28,13 @@ impl BgbClient {
         stream.set_nodelay(true).ok();
 
         // Perform handshake on this thread before spawning
-        let start_time = Instant::now();
-        handshake(&mut stream, start_time)?;
+        handshake(&mut stream)?;
 
         let (send_tx, send_rx) = mpsc::channel::<u8>();
         let (recv_tx, recv_rx) = mpsc::channel::<u8>();
 
         let thread = std::thread::spawn(move || {
-            bgb_thread(stream, start_time, send_rx, recv_tx, log_tx, verbose);
+            bgb_thread(stream, send_rx, recv_tx, log_tx, verbose);
         });
 
         Ok(Self {
@@ -53,12 +53,7 @@ impl BgbClient {
     }
 }
 
-fn timestamp(start: Instant) -> u32 {
-    let secs = start.elapsed().as_secs_f64();
-    ((secs * (1u64 << 21) as f64) as u32) & 0x7FFF_FFFF
-}
-
-fn handshake(stream: &mut TcpStream, start: Instant) -> Result<(), String> {
+fn handshake(stream: &mut TcpStream) -> Result<(), String> {
     // Send version: protocol 1, max 4
     send_packet(stream, &BgbPacket::new(1, 1, 4, 0, 0))?;
 
@@ -68,8 +63,8 @@ fn handshake(stream: &mut TcpStream, start: Instant) -> Result<(), String> {
         return Err(format!("Expected version (cmd=1), got cmd={}", resp.command));
     }
 
-    // Send initial status (running)
-    send_packet(stream, &BgbPacket::new(108, 1, 0, 0, timestamp(start)))?;
+    // Send initial status (running) — timestamp 0, BGB will tell us its clock
+    send_packet(stream, &BgbPacket::new(108, 1, 0, 0, 0))?;
 
     Ok(())
 }
@@ -78,7 +73,6 @@ fn handshake(stream: &mut TcpStream, start: Instant) -> Result<(), String> {
 /// and handles data exchange requests from the main thread.
 fn bgb_thread(
     mut stream: TcpStream,
-    start: Instant,
     send_rx: mpsc::Receiver<u8>,
     recv_tx: mpsc::Sender<u8>,
     log_tx: Option<mpsc::Sender<String>>,
@@ -107,14 +101,23 @@ fn bgb_thread(
     let mut read_pos: usize = 0;
     let mut exchange_count: u64 = 0;
     let mut last_exchange_time = Instant::now();
+    // Track BGB's emulated clock to stay synchronized.
+    // Using real wall-clock time causes exponential blowup because BGB has to
+    // emulate Game Boy CPU cycles to reach our timestamp.
+    let mut bgb_timestamp: u32 = 0;
 
     loop {
         // Check if there's a byte to send (non-blocking)
         if !waiting_for_response {
             match send_rx.try_recv() {
                 Ok(byte) => {
-                    let ts = timestamp(start);
-                    // SC=0x81: internal clock (we are the master / clock provider)
+                    // Use BGB's last known timestamp + reasonable increment to stay in sync
+                    // with BGB's emulated clock. Using wall-clock time causes exponential
+                    // blowup as BGB tries to emulate to catch up to our timestamp.
+                    // 8192 ticks ≈ 3.9ms in GB time (2^21 ticks/sec), roughly one serial transfer.
+                    let ts = bgb_timestamp.wrapping_add(8192);
+                    // SC=0x81: internal clock. We (web client) are the clock master,
+                    // the Game Boy in BGB is the slave.
                     if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x81, 0, ts)).is_err() {
                         log("BGB send failed, disconnecting".into());
                         return;
@@ -174,6 +177,9 @@ fn bgb_thread(
                 read_buf.copy_within(8.., 0);
             }
             read_pos = remaining;
+
+            // Track BGB's emulated clock from every packet
+            bgb_timestamp = pkt.timestamp;
 
             match pkt.command {
                 104 => {
