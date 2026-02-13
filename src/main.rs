@@ -126,38 +126,46 @@ impl BridgeApp {
     }
 
     fn poll_events(&mut self) {
-        if let Some(rx) = &self.event_rx {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    WsEvent::Log(msg) => {
-                        self.write_log(&msg);
-                        self.log.push(msg);
-                        // Cap log to prevent unbounded memory growth
-                        if self.log.len() > 500 {
-                            self.log.drain(..self.log.len() - 300);
-                        }
+        // Take the receiver out temporarily to avoid borrow conflict
+        let rx = match self.event_rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                WsEvent::Log(msg) => {
+                    self.write_log(&msg);
+                    self.log.push(msg);
+                    // Cap log to prevent unbounded memory growth
+                    if self.log.len() > 500 {
+                        self.log.drain(..self.log.len() - 300);
                     }
-                    WsEvent::BrowserConnected => self.browser_connected = true,
-                    WsEvent::BrowserDisconnected => self.browser_connected = false,
-                    WsEvent::BgbConnected => self.bgb_connected = true,
-                    WsEvent::BgbDisconnected => self.bgb_connected = false,
-                    WsEvent::Stopped => {
-                        self.running = false;
-                        self.bgb_connected = false;
-                        self.browser_connected = false;
-                        self.cmd_tx = None;
-                        self.event_rx = None;
-                        self.log.push("Stopped.".into());
-                        self.write_log("Stopped");
-                        if let Some(ref mut f) = self.log_file {
-                            let _ = f.flush();
-                        }
-                        self.verbose_flag = None;
-                        return;
+                }
+                WsEvent::BrowserConnected => self.browser_connected = true,
+                WsEvent::BrowserDisconnected => self.browser_connected = false,
+                WsEvent::BgbConnected => self.bgb_connected = true,
+                WsEvent::BgbDisconnected => self.bgb_connected = false,
+                WsEvent::Stopped => {
+                    self.running = false;
+                    self.bgb_connected = false;
+                    self.browser_connected = false;
+                    self.cmd_tx = None;
+                    self.log.push("Stopped.".into());
+                    self.write_log("Stopped");
+                    if let Some(ref mut f) = self.log_file {
+                        let _ = f.flush();
                     }
+                    self.verbose_flag = None;
+                    // Don't put rx back — we're stopped
+                    return;
                 }
             }
         }
+
+        // Put the receiver back
+        self.event_rx = Some(rx);
+
         // Periodically flush log file
         if let Some(ref mut f) = self.log_file {
             let _ = f.flush();
