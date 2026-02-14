@@ -101,18 +101,22 @@ fn bgb_thread(
     let mut read_pos: usize = 0;
     let mut exchange_count: u64 = 0;
     let mut last_exchange_time = Instant::now();
-    // Simple monotonic counter for BGB timestamps. We always send timestamps
-    // "in the past" relative to BGB's real clock, so BGB processes transfers
-    // immediately without needing to emulate forward.
-    let mut next_timestamp: u32 = 0;
+    // Track the latest timestamp seen from BGB so our outgoing timestamps
+    // are always "in the past" relative to BGB's emulated clock.
+    // Without this, idle periods (matchmaking, music select) let BGB's clock
+    // advance millions of cycles while our counter stays low, and rapid
+    // exchanges during game start eventually overtake BGB's clock, causing
+    // it to stall waiting for emulation to catch up.
+    let mut bgb_timestamp: u32 = 0;
 
     loop {
         // Check if there's a byte to send (non-blocking)
         if !waiting_for_response {
             match send_rx.try_recv() {
                 Ok(byte) => {
-                    next_timestamp = next_timestamp.wrapping_add(8192);
-                    let ts = next_timestamp;
+                    // Use BGB's latest known timestamp minus a small offset so
+                    // our transfer is always in the past and processed immediately.
+                    let ts = bgb_timestamp.wrapping_sub(8192);
                     // SC=0x81: internal clock. We (web client) are the clock master,
                     // the Game Boy in BGB is the slave.
                     if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x81, 0, ts)).is_err() {
@@ -123,7 +127,7 @@ fn bgb_thread(
                     waiting_for_response = true;
                     exchange_count += 1;
                     last_exchange_time = Instant::now();
-                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x81 ts={}", exchange_count, byte, ts));
+                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x81 ts={} (bgb_ts={})", exchange_count, byte, ts, bgb_timestamp));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log("Bridge dropped, closing BGB connection".into());
@@ -174,6 +178,11 @@ fn bgb_thread(
                 read_buf.copy_within(8.., 0);
             }
             read_pos = remaining;
+
+            // Track BGB's clock from every incoming packet so we stay in sync
+            if pkt.timestamp != 0 {
+                bgb_timestamp = pkt.timestamp;
+            }
 
             match pkt.command {
                 104 => {
