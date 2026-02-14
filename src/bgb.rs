@@ -118,8 +118,9 @@ fn bgb_thread(
                     let elapsed_secs = last_received_instant.elapsed().as_secs_f64();
                     let offset = (elapsed_secs * (1u64 << 21) as f64) as u32;
                     let ts = last_received_timestamp.wrapping_add(offset);
-                    // SC=0x80: matches working Python reference implementation
-                    if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x80, 0, ts)).is_err() {
+                    // SC=0x81: internal clock (master). Tetris requires the web
+                    // client to drive the clock; BGB's Game Boy is the slave.
+                    if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x81, 0, ts)).is_err() {
                         log("BGB send failed, disconnecting".into());
                         return;
                     }
@@ -127,7 +128,7 @@ fn bgb_thread(
                     waiting_for_response = true;
                     exchange_count += 1;
                     last_exchange_time = Instant::now();
-                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x80 ts={} (base_ts={} +{})", exchange_count, byte, ts, last_received_timestamp, offset));
+                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x81 ts={} (base_ts={} +{})", exchange_count, byte, ts, last_received_timestamp, offset));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log("Bridge dropped, closing BGB connection".into());
