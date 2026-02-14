@@ -101,25 +101,25 @@ fn bgb_thread(
     let mut read_pos: usize = 0;
     let mut exchange_count: u64 = 0;
     let mut last_exchange_time = Instant::now();
-    // Track the latest timestamp seen from BGB so our outgoing timestamps
-    // are always "in the past" relative to BGB's emulated clock.
-    // Without this, idle periods (matchmaking, music select) let BGB's clock
-    // advance millions of cycles while our counter stays low, and rapid
-    // exchanges during game start eventually overtake BGB's clock, causing
-    // it to stall waiting for emulation to catch up.
-    let mut bgb_timestamp: u32 = 0;
+    // Wall-clock-based timestamp tracking (matches Python BGBLinkCableServer):
+    // We store the last received BGB timestamp and the wall-clock Instant when
+    // we received it. Outgoing timestamps = last_ts + (wall_elapsed * 2^21).
+    // This keeps timestamps advancing at the GB's ~2.097MHz clock rate.
+    let mut last_received_timestamp: u32 = 0;
+    let mut last_received_instant: Instant = Instant::now();
 
     loop {
         // Check if there's a byte to send (non-blocking)
         if !waiting_for_response {
             match send_rx.try_recv() {
                 Ok(byte) => {
-                    // Use BGB's latest known timestamp minus a small offset so
-                    // our transfer is always in the past and processed immediately.
-                    let ts = bgb_timestamp.wrapping_sub(8192);
-                    // SC=0x81: internal clock. We (web client) are the clock master,
-                    // the Game Boy in BGB is the slave.
-                    if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x81, 0, ts)).is_err() {
+                    // Calculate timestamp: last received + wall-clock elapsed in GB cycles
+                    // 1 second = 2^21 GB CPU cycles (≈ 2.097 MHz)
+                    let elapsed_secs = last_received_instant.elapsed().as_secs_f64();
+                    let offset = (elapsed_secs * (1u64 << 21) as f64) as u32;
+                    let ts = last_received_timestamp.wrapping_add(offset);
+                    // SC=0x80: matches working Python reference implementation
+                    if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x80, 0, ts)).is_err() {
                         log("BGB send failed, disconnecting".into());
                         return;
                     }
@@ -127,7 +127,7 @@ fn bgb_thread(
                     waiting_for_response = true;
                     exchange_count += 1;
                     last_exchange_time = Instant::now();
-                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x81 ts={} (bgb_ts={})", exchange_count, byte, ts, bgb_timestamp));
+                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x80 ts={} (base_ts={} +{})", exchange_count, byte, ts, last_received_timestamp, offset));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log("Bridge dropped, closing BGB connection".into());
@@ -179,9 +179,11 @@ fn bgb_thread(
             }
             read_pos = remaining;
 
-            // Track BGB's clock from every incoming packet so we stay in sync
+            // Track BGB's clock and the wall-clock instant we received it,
+            // so outgoing timestamps stay in sync with BGB's emulated clock.
             if pkt.timestamp != 0 {
-                bgb_timestamp = pkt.timestamp;
+                last_received_timestamp = pkt.timestamp;
+                last_received_instant = Instant::now();
             }
 
             match pkt.command {
