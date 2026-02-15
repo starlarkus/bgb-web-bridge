@@ -7,3 +7,4 @@ description = "Bridge between BGB emulator and GB Tetris Web via WebSocket"
 [dependencies]
 eframe = "0.29"
 tungstenite = "0.24"
+serde_json = "1"

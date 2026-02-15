@@ -1,7 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod bgb;
-mod bridge;
+mod game;
 mod protocol;
 mod websocket;
 
