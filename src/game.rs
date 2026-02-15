@@ -77,6 +77,7 @@ pub struct GameThread {
     opponent_height: u8,
     command_queue: Vec<u8>,
     game_started_at: Option<std::time::Instant>,
+    game_ended: bool,
 }
 
 impl GameThread {
@@ -94,6 +95,7 @@ impl GameThread {
             opponent_height: 0,
             command_queue: Vec::new(),
             game_started_at: None,
+            game_ended: false,
         }
     }
 
@@ -210,6 +212,7 @@ impl GameThread {
         self.phase = Phase::GameStarting;
         self.command_queue.clear();
         self.opponent_height = 0;
+        self.game_ended = false;
 
         if is_first {
             self.log("First game start sequence");
@@ -257,6 +260,17 @@ impl GameThread {
     }
 
     fn run_game_loop_tick(&mut self) {
+        if self.game_ended {
+            // After win/lose, only drain queued commands (one per tick), don't
+            // send height or interpret responses. Matches WebUSB behaviour where
+            // gameLoopActive = false stops the loop but queued bytes still send.
+            if !self.command_queue.is_empty() {
+                let cmd = self.command_queue.remove(0);
+                let _ = self.exchange(cmd);
+            }
+            return;
+        }
+
         // Determine what byte to send (priority: queued commands > opponent height)
         let byte_to_send = if !self.command_queue.is_empty() {
             self.command_queue.remove(0)
@@ -285,6 +299,7 @@ impl GameThread {
             // We won by reaching 30 lines
             self.log("Game Boy reports WIN (0x77)");
             self.send_event(GameEvent::Win);
+            self.game_ended = true;
         } else if value == 0xAA {
             // We lost (topped out)
             // Ignore topped-out signal in first 3 seconds
@@ -296,11 +311,10 @@ impl GameThread {
             }
             self.log("Game Boy reports LOSE (0xAA)");
             self.send_event(GameEvent::Lose);
+            self.game_ended = true;
         } else if value == 0xFF {
-            // Screen filled after loss
+            // Screen filled after loss — let the web callback handle queuing 0x43
             self.send_event(GameEvent::ScreenFilled);
-            // Queue the final screen command
-            self.command_queue.push(0x43);
         }
     }
 
