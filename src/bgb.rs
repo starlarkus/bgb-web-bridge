@@ -101,23 +101,20 @@ fn bgb_thread(
     let mut read_pos: usize = 0;
     let mut exchange_count: u64 = 0;
     let mut last_exchange_time = Instant::now();
-    // Wall-clock-based timestamp tracking (matches Python BGBLinkCableServer):
-    // We store the last received BGB timestamp and the wall-clock Instant when
-    // we received it. Outgoing timestamps = last_ts + (wall_elapsed * 2^21).
-    // This keeps timestamps advancing at the GB's ~2.097MHz clock rate.
+    let mut last_wait_log_secs: u64 = 0;
+    // Wall-clock-based timestamp tracking removed — it produced timestamps
+    // that were too far behind BGB's internal clock, causing multi-second stalls.
+    // Instead, we echo BGB's last received timestamp + small offset.
     let mut last_received_timestamp: u32 = 0;
-    let mut last_received_instant: Instant = Instant::now();
 
     loop {
         // Check if there's a byte to send (non-blocking)
         if !waiting_for_response {
             match send_rx.try_recv() {
                 Ok(byte) => {
-                    // Calculate timestamp: last received + wall-clock elapsed in GB cycles
-                    // 1 second = 2^21 GB CPU cycles (≈ 2.097 MHz)
-                    let elapsed_secs = last_received_instant.elapsed().as_secs_f64();
-                    let offset = (elapsed_secs * (1u64 << 21) as f64) as u32;
-                    let ts = last_received_timestamp.wrapping_add(offset);
+                    // Use BGB's last timestamp + small fixed offset.
+                    // This tells BGB "I'm at the same point in time as you"
+                    let ts = last_received_timestamp.wrapping_add(8);
                     // SC=0x81: internal clock (master). Tetris requires the web
                     // client to drive the clock; BGB's Game Boy is the slave.
                     if send_packet(&mut stream, &BgbPacket::new(104, byte, 0x81, 0, ts)).is_err() {
@@ -128,7 +125,8 @@ fn bgb_thread(
                     waiting_for_response = true;
                     exchange_count += 1;
                     last_exchange_time = Instant::now();
-                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x81 ts={} (base_ts={} +{})", exchange_count, byte, ts, last_received_timestamp, offset));
+                    last_wait_log_secs = 0;
+                    vlog(format!("[SEND] sync1 #{}: data=0x{:02X} sc=0x81 ts={}", exchange_count, byte, ts));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log("Bridge dropped, closing BGB connection".into());
@@ -148,13 +146,17 @@ fn bgb_thread(
                 read_pos += n;
             }
             Err(ref e) if is_timeout(e) => {
-                // No data available right now — log if we've been waiting a while
+                // No data available right now
                 if waiting_for_response {
                     let waited = last_exchange_time.elapsed();
-                    if waited.as_secs() >= 2 && waited.as_secs() % 2 == 0 && waited.subsec_millis() < 5 {
+                    let waited_secs = waited.as_secs();
+                    if waited_secs >= 2 && waited_secs > last_wait_log_secs {
+                        last_wait_log_secs = waited_secs;
                         vlog(format!("[WAIT] sync2 for #{} (sent 0x{:02X}): waiting {}s...",
-                            exchange_count, pending_byte, waited.as_secs()));
+                            exchange_count, pending_byte, waited_secs));
                     }
+                    // Small sleep to avoid busy-spinning while waiting
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 if read_pos == 0 && !waiting_for_response {
                     std::thread::sleep(Duration::from_millis(1));
@@ -180,11 +182,9 @@ fn bgb_thread(
             }
             read_pos = remaining;
 
-            // Track BGB's clock and the wall-clock instant we received it,
-            // so outgoing timestamps stay in sync with BGB's emulated clock.
+            // Track BGB's clock so our outgoing timestamps stay in sync.
             if pkt.timestamp != 0 {
                 last_received_timestamp = pkt.timestamp;
-                last_received_instant = Instant::now();
             }
 
             match pkt.command {
